@@ -72,8 +72,11 @@
   #modeToggle.active{background:var(--teal);color:#05201c;border-color:var(--teal);}
   .iconbtn-visible{background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:8px 12px;font-size:12.5px;cursor:pointer;min-height:36px;}
   .iconbtn-visible:disabled{opacity:.35;cursor:default;}
-  body.manager-mode #sortBtn, body.manager-mode #undoBtn{display:none;}
+  body.manager-mode #sortBtn, body.manager-mode #undoBtn, body.manager-mode #employeeToggle{display:none;}
   body.manager-mode #legend{display:none;}
+  body.employee-mode #sortBtn, body.employee-mode #undoBtn, body.employee-mode #modeToggle{display:none;}
+  body.employee-mode #legend{display:none;}
+  .iconbtn-visible.active{background:var(--teal);color:#05201c;border-color:var(--teal);}
 
   #graphwrap{flex:1;position:relative;overflow:hidden;}
   svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none;}
@@ -129,6 +132,21 @@
   body.manager-mode #graphwrap{display:none;}
   body.manager-mode #managerView{display:block;}
   body.manager-mode #sidebar{display:none;}
+
+  #employeeView{display:none;flex:1;overflow-y:auto;padding:20px;}
+  body.employee-mode #graphwrap{display:none;}
+  body.employee-mode #employeeView{display:block;}
+  body.employee-mode #sidebar{display:none;}
+  .emp-picker{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;}
+  .emp-picker label{display:flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--border);border-radius:20px;padding:7px 13px;font-size:12.5px;cursor:pointer;}
+  .emp-picker input{width:auto;min-height:auto;}
+  .emp-card{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .emp-card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;gap:8px;}
+  .emp-card-head h3{margin:0;font-size:14.5px;}
+  .emp-out-flag{background:#3a2020;color:#ff9d9d;font-size:10.5px;padding:3px 7px;border-radius:5px;flex:0 0 auto;}
+  .emp-bar-track{background:#0d1218;border-radius:6px;height:10px;overflow:hidden;margin-bottom:5px;}
+  .emp-bar-fill{height:100%;border-radius:6px;transition:width .3s ease, background .3s ease;}
+  .emp-pct{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:8px;}
   .mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;}
   .mcard{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;cursor:pointer;}
   .mcard-head{display:flex;align-items:center;gap:9px;}
@@ -264,6 +282,7 @@
       <div id="legend"><span>ruhig</span><div class="bar"></div><span>überlastet</span></div>
       <button id="sortBtn" class="iconbtn-visible" type="button">↕ Sortieren</button>
       <button id="undoBtn" class="iconbtn-visible" type="button" disabled>↩ Rückgängig</button>
+      <button id="employeeToggle" class="iconbtn-visible" type="button">Mitarbeiter-Ansicht</button>
       <button id="modeToggle">Manager-Ansicht</button>
     </div>
 
@@ -271,6 +290,11 @@
 
     <div id="managerView">
       <div class="mgrid" id="mgrid"></div>
+    </div>
+
+    <div id="employeeView">
+      <div class="emp-picker" id="empPicker"></div>
+      <div class="mgrid" id="empList"></div>
     </div>
 
     <div id="timeline">
@@ -314,6 +338,8 @@
   let selectedId = null;
   let hoveredId = null;
   let managerMode = false;
+  let employeeMode = false;
+  const selectedEmployees = new Set();
   let currentNodesSel = null, currentLinksSel = null, currentLinksData = [];
   let playTimer = null;
   const nodeById = new Map();
@@ -416,6 +442,34 @@
     }
     return false;
   }
+  // finer-grained severity for projects: ok (green) -> demanding (yellow) -> hot (orange) -> error (red)
+  function projectSeverity(it, day, loads){
+    if(it.assignees.length === 0) return 'error';
+    if(it.__leadOut) return 'error';
+    const effective = it.assignees.filter(pid => !personOutOn(pid, day));
+    if(effective.length === 0) return 'error';
+    const anyOut = effective.length < it.assignees.length;
+    let maxRatio = 0;
+    it.assignees.forEach(pid => {
+      if(personOutOn(pid, day)) return;
+      const p = state.people.find(pp=>pp.id===pid);
+      const l = loads.get(pid);
+      const ratio = (p && l) ? l.total / p.capacity : 0;
+      if(ratio > maxRatio) maxRatio = ratio;
+    });
+    if(maxRatio > 1.4) return 'error';
+    if(maxRatio > 1.15 || anyOut) return 'hot';
+    if(maxRatio > 1.0) return 'demanding';
+    return 'ok';
+  }
+  function projectStatusStyle(sev){
+    switch(sev){
+      case 'error':      return {fill:'#5a2020', stroke:'#ef4444', dash:null,  width:3.5, fillOpacity:1};
+      case 'hot':        return {fill:'#5a3a12', stroke:'#f97316', dash:null,  width:3,   fillOpacity:0.85};
+      case 'demanding':  return {fill:'#4a3f12', stroke:'#eab308', dash:'6 3', width:2.3, fillOpacity:0.65};
+      default:           return {fill:'#2c3e6e', stroke:'#22c55e', dash:'5 4', width:2,   fillOpacity:0.55};
+    }
+  }
 
   // ---------------- icons ----------------
   const ICONS = ['user','users','user-cog','user-check','graduation-cap','headset','building-2','building',
@@ -457,7 +511,8 @@
       nodes.push(Object.assign({}, c, {ntype:'client'}, getInitPos(c.id)));
     });
     state.items.forEach(it => {
-      nodes.push(Object.assign({}, it, {ntype: it.type, hasError: itemHasError(it, day, loads)}, getInitPos(it.id)));
+      nodes.push(Object.assign({}, it, {ntype: it.type, hasError: itemHasError(it, day, loads),
+        severity: it.type==='project' ? projectSeverity(it, day, loads) : null}, getInitPos(it.id)));
     });
 
     nodeById.clear();
@@ -521,6 +576,7 @@
   function render(structural){
     if(structural === undefined) structural = true;
     if(managerMode){ renderManager(); renderTimeline(); return; }
+    if(employeeMode){ renderEmployeeView(); renderTimeline(); return; }
     const {w,h} = dims();
     renderBands(w, h);
     const {nodes, links} = buildGraph();
@@ -582,9 +638,9 @@
           .attr('stroke-width', isSelected?3:2).attr('stroke-dasharray', '4 3')
           .classed('selected', isSelected);
       } else if(d.ntype === 'project'){
-        const st = statusStyle(d.hasError);
+        const st = projectStatusStyle(d.severity);
         g.select('rect.shape').attr('x',-r).attr('y',-r*0.75).attr('width',r*2).attr('height',r*1.5).attr('rx',6)
-          .attr('fill', d.hasError ? '#5a2020' : '#2c3e6e').attr('fill-opacity', st.fillOpacity)
+          .attr('fill', st.fill).attr('fill-opacity', st.fillOpacity)
           .attr('stroke', isSelected?'#fff':st.stroke)
           .attr('stroke-width', isSelected?3:st.width)
           .attr('stroke-dasharray', isSelected ? null : st.dash)
@@ -609,7 +665,7 @@
           d.ntype==='person' ? (d.out ? 'ausgefallen' : Math.round((d.ratio||0)*100)+'%') :
           d.ntype==='client' ? 'Kunde' :
           d.ntype==='task' ? (d.__blocked ? 'blockiert' : (d.shareable?'teilbar · ':'fix · ')+d.load) :
-          (d.__blocked || d.__leadOut ? 'blockiert' : 'Projekt · '+d.load)
+          ({error:'kritisch', hot:'hot', demanding:'demanding', ok:'Projekt · '+d.load}[d.severity] || 'Projekt · '+d.load)
         );
     });
 
@@ -757,6 +813,50 @@
       else collapsed.push({startDay:e.human, endDay:e.human, level:e.level, involved:e.involved, structural:e.structural, detail:e.detail, sig});
     });
     return collapsed;
+  }
+
+  // ---------------- employee view ----------------
+  function renderEmployeeView(){
+    const day = timeline.currentDay;
+    const loads = computeLoads(day);
+
+    const picker = document.getElementById('empPicker');
+    if(state.people.length === 0){
+      picker.innerHTML = '<span class="hint">Noch keine Personen angelegt.</span>';
+    } else {
+      picker.innerHTML = state.people.map(p =>
+        `<label><input type="checkbox" data-pid="${p.id}" ${selectedEmployees.has(p.id)?'checked':''}> ${escapeHtml(p.name)}</label>`
+      ).join('');
+      picker.querySelectorAll('input[type=checkbox]').forEach(cb => {
+        cb.addEventListener('change', e => {
+          const pid = e.target.getAttribute('data-pid');
+          if(e.target.checked) selectedEmployees.add(pid); else selectedEmployees.delete(pid);
+          renderEmployeeView();
+        });
+      });
+    }
+
+    const list = document.getElementById('empList');
+    document.getElementById('stats').innerHTML = `<span>Mitarbeiter-Ansicht · ${selectedEmployees.size} ausgewählt</span>`;
+    if(selectedEmployees.size === 0){
+      list.innerHTML = '<div class="mgrid-empty">Wähle oben mindestens eine Person aus, um ihre Auslastung zu sehen.</div>';
+      return;
+    }
+    list.innerHTML = Array.from(selectedEmployees).map(pid => {
+      const p = state.people.find(pp=>pp.id===pid);
+      if(!p) return '';
+      const out = personOutOn(pid, day);
+      const l = loads.get(pid) || {total:0, breakdown:[]};
+      const ratio = l.total / p.capacity;
+      const col = stressColor(ratio);
+      return `
+        <div class="emp-card">
+          <div class="emp-card-head"><h3>${escapeHtml(p.name)}</h3>${out ? '<span class="emp-out-flag">heute ausgefallen</span>' : ''}</div>
+          <div class="emp-bar-track"><div class="emp-bar-fill" style="width:${Math.min(100, ratio*100)}%;background:${col}"></div></div>
+          <div class="emp-pct" style="color:${col}">${Math.round(ratio*100)}% · ${l.total.toFixed(1)} von ${p.capacity}</div>
+          <ul class="breakdown">${l.breakdown.length ? l.breakdown.map(b=>`<li><span>${escapeHtml(b.name)}</span><span class="mono">${b.share.toFixed(1)}</span></li>`).join('') : '<li>Keine Zuordnungen heute</li>'}</ul>
+        </div>`;
+    }).join('');
   }
 
   function renderManager(){
@@ -1052,15 +1152,21 @@
     render(true);
   });
 
-  document.getElementById('modeToggle').addEventListener('click', () => {
-    managerMode = !managerMode;
-    selectedId = null;
+  function setViewMode(mode){ // 'team' | 'manager' | 'employee'
+    managerMode = (mode === 'manager');
+    employeeMode = (mode === 'employee');
     document.body.classList.toggle('manager-mode', managerMode);
+    document.body.classList.toggle('employee-mode', employeeMode);
     document.getElementById('modeToggle').textContent = managerMode ? 'Team-Ansicht' : 'Manager-Ansicht';
     document.getElementById('modeToggle').classList.toggle('active', managerMode);
+    document.getElementById('employeeToggle').textContent = employeeMode ? 'Team-Ansicht' : 'Mitarbeiter-Ansicht';
+    document.getElementById('employeeToggle').classList.toggle('active', employeeMode);
+    selectedId = null;
     render();
     renderDetail();
-  });
+  }
+  document.getElementById('modeToggle').addEventListener('click', () => setViewMode(managerMode ? 'team' : 'manager'));
+  document.getElementById('employeeToggle').addEventListener('click', () => setViewMode(employeeMode ? 'team' : 'employee'));
 
   // ---------------- mobile panel toggles ----------------
   function openDetailMobile(){
