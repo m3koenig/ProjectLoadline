@@ -2,8 +2,16 @@
 <html lang="de">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Belastungskarte</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Project LoadLine</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0a0e13">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LoadLine">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
@@ -54,7 +62,7 @@
 
   /* ---------- main / graph ---------- */
   #main{flex:1;display:flex;flex-direction:column;min-width:0;}
-  #topbar{padding:10px 20px;border-bottom:1px solid var(--border);background:var(--panel);display:flex;align-items:center;gap:16px;flex-wrap:wrap;}
+  #topbar{padding:10px 20px;padding-top:calc(10px + env(safe-area-inset-top));border-bottom:1px solid var(--border);background:var(--panel);display:flex;align-items:center;gap:16px;flex-wrap:wrap;}
   .iconbtn{display:none;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:8px 10px;font-size:12.5px;cursor:pointer;min-height:36px;}
   #stats{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--text-dim);}
   #stats b{color:var(--text);font-family:'JetBrains Mono',monospace;font-weight:600;}
@@ -62,11 +70,17 @@
   #legend .bar{width:110px;height:8px;border-radius:4px;background:linear-gradient(90deg,#1b3a3a,#2dd4bf 40%,#f5a524 70%,#ef4444 100%);}
   #modeToggle{margin-left:auto;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:8px 12px;font-size:12.5px;cursor:pointer;font-weight:600;min-height:36px;}
   #modeToggle.active{background:var(--teal);color:#05201c;border-color:var(--teal);}
+  .iconbtn-visible{background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:8px 12px;font-size:12.5px;cursor:pointer;min-height:36px;}
+  .iconbtn-visible:disabled{opacity:.35;cursor:default;}
+  body.manager-mode #sortBtn, body.manager-mode #undoBtn{display:none;}
   body.manager-mode #legend{display:none;}
 
   #graphwrap{flex:1;position:relative;overflow:hidden;}
   svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none;}
   svg:active{cursor:grabbing;}
+
+  .bandline{stroke:#1c2430;stroke-width:1;}
+  .bandlabel{fill:#3a4553;font-size:10.5px;font-family:'JetBrains Mono',monospace;letter-spacing:.6px;text-transform:uppercase;pointer-events:none;}
 
   .link{stroke:#3a4553;stroke-opacity:.45;transition:opacity .25s ease;}
   .link-lead{stroke:var(--gold);stroke-dasharray:5 4;stroke-opacity:.6;}
@@ -102,7 +116,7 @@
   #detail .flag.out{background:#3a2020;color:#ff9d9d;}
 
   /* ---------- timeline ---------- */
-  #timeline{border-top:1px solid var(--border);background:var(--panel);padding:10px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+  #timeline{border-top:1px solid var(--border);background:var(--panel);padding:10px 20px;padding-bottom:calc(10px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
   #timeline .daylabel{font-family:'JetBrains Mono',monospace;font-size:13px;min-width:78px;}
   #playbtn{background:var(--panel-2);border:1px solid var(--border);color:var(--teal);border-radius:50%;width:38px;height:38px;font-size:14px;cursor:pointer;flex:0 0 auto;}
   #timeline input[type=range]{flex:1;min-width:120px;accent-color:var(--teal);}
@@ -248,6 +262,8 @@
       <button class="iconbtn" id="openSidebar">☰ Hinzufügen</button>
       <div id="stats"></div>
       <div id="legend"><span>ruhig</span><div class="bar"></div><span>überlastet</span></div>
+      <button id="sortBtn" class="iconbtn-visible" type="button">↕ Sortieren</button>
+      <button id="undoBtn" class="iconbtn-visible" type="button" disabled>↩ Rückgängig</button>
       <button id="modeToggle">Manager-Ansicht</button>
     </div>
 
@@ -465,25 +481,49 @@
   const svg = d3.select('#svg');
   const iconDefsSel = svg.append('defs').attr('id','iconDefs');
   const container = svg.append('g').attr('class','zoom-root');
+  const gBandsZ = container.append('g').attr('class','bands');
   const gLinksZ = container.append('g').attr('class','links');
   const gNodesZ = container.append('g').attr('class','nodes');
 
   svg.call(d3.zoom().scaleExtent([0.3,2.5]).on('zoom', ev => container.attr('transform', ev.transform)));
 
   function dims(){ const el = document.getElementById('graphwrap'); return {w: el.clientWidth, h: el.clientHeight}; }
+  function bandY(ntype, h){
+    if(ntype === 'client') return h * 0.10;
+    if(ntype === 'project') return h * 0.32;
+    if(ntype === 'task') return h * 0.58;
+    return h * 0.85; // person
+  }
 
   const simulation = d3.forceSimulation()
-    .force('link', d3.forceLink().id(d => d.id).distance(d => d.ltype==='client'?150:(d.ltype==='lead'?125:110)).strength(d => d.ltype==='client'?0.25:0.5))
-    .force('charge', d3.forceManyBody().strength(-420))
-    .force('center', d3.forceCenter())
+    .force('link', d3.forceLink().id(d => d.id).distance(d => d.ltype==='client'?90:(d.ltype==='lead'?90:80)).strength(d => d.ltype==='client'?0.15:0.25))
+    .force('charge', d3.forceManyBody().strength(-260))
+    .force('x', d3.forceX(() => dims().w/2).strength(0.025))
+    .force('y', d3.forceY(d => bandY(d.ntype, dims().h)).strength(0.9))
     .force('collision', d3.forceCollide().radius(d => nodeRadiusFor(d) + 16));
+
+  function renderBands(w, h){
+    const rows = [
+      {y: bandY('client', h), label: 'Kunden'},
+      {y: bandY('project', h), label: 'Projekte'},
+      {y: bandY('task', h), label: 'Aufgaben'},
+      {y: bandY('person', h), label: 'Personen'}
+    ];
+    const sel = gBandsZ.selectAll('g.bandrow').data(rows, d => d.label);
+    const enter = sel.enter().append('g').attr('class','bandrow');
+    enter.append('line').attr('class','bandline');
+    enter.append('text').attr('class','bandlabel');
+    const all = enter.merge(sel);
+    all.select('line.bandline').attr('x1', 16).attr('x2', Math.max(w-16,16)).attr('y1', d=>d.y-1).attr('y2', d=>d.y-1);
+    all.select('text.bandlabel').attr('x', 14).attr('y', d=>d.y-10).text(d=>d.label);
+  }
 
   function render(structural){
     if(structural === undefined) structural = true;
     if(managerMode){ renderManager(); renderTimeline(); return; }
     const {w,h} = dims();
+    renderBands(w, h);
     const {nodes, links} = buildGraph();
-    simulation.force('center', d3.forceCenter(w/2, h/2));
     simulation.nodes(nodes).on('tick', ticked);
     simulation.force('link').links(links);
     if(structural) simulation.alpha(0.7).restart();
@@ -504,7 +544,7 @@
       if(d.ntype === 'person') g.append('circle').attr('class','shape');
       else if(d.ntype === 'client') g.append('path').attr('class','shape');
       else if(d.ntype === 'project') g.append('rect').attr('class','shape');
-      else g.append('circle').attr('class','shape');
+      else g.append('polygon').attr('class','shape');
       g.append('use').attr('class','node-icon');
       g.append('text').attr('class','node-label');
       g.append('text').attr('class','node-sub');
@@ -551,12 +591,14 @@
           .classed('selected',isSelected);
       } else {
         const st = statusStyle(d.hasError);
-        g.select('circle.shape').attr('r', r)
+        const tp = `0,${-r} ${(r*0.866).toFixed(1)},${(r*0.5).toFixed(1)} ${(-r*0.866).toFixed(1)},${(r*0.5).toFixed(1)}`;
+        g.select('polygon.shape').attr('points', tp)
           .attr('fill', d.hasError ? '#5a2020' : (d.shareable ? '#1f4a48' : '#4a3320'))
           .attr('fill-opacity', st.fillOpacity)
           .attr('stroke', isSelected?'#fff':st.stroke)
           .attr('stroke-width', isSelected?3:st.width)
           .attr('stroke-dasharray', isSelected ? null : st.dash)
+          .attr('stroke-linejoin', 'round')
           .classed('selected',isSelected);
       }
 
@@ -988,6 +1030,28 @@
   });
 
   // ---------------- mode toggle ----------------
+  // ---------------- sort / undo ----------------
+  let preSortPositions = null;
+
+  document.getElementById('sortBtn').addEventListener('click', () => {
+    preSortPositions = new Map();
+    nodeById.forEach((n, id) => { preSortPositions.set(id, {x:n.x, y:n.y, fx:n.fx, fy:n.fy}); });
+    nodeById.forEach(n => { n.fx = null; n.fy = null; });
+    document.getElementById('undoBtn').disabled = false;
+    render(true);
+  });
+
+  document.getElementById('undoBtn').addEventListener('click', () => {
+    if(!preSortPositions) return;
+    nodeById.forEach((n, id) => {
+      const p = preSortPositions.get(id);
+      if(p){ n.x = p.x; n.y = p.y; n.fx = p.fx; n.fy = p.fy; }
+    });
+    preSortPositions = null;
+    document.getElementById('undoBtn').disabled = true;
+    render(true);
+  });
+
   document.getElementById('modeToggle').addEventListener('click', () => {
     managerMode = !managerMode;
     selectedId = null;
@@ -1138,6 +1202,12 @@
   render();
   renderDetail();
   loadIconSprite();
+
+  if('serviceWorker' in navigator){
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
+  }
 })();
 </script>
 </body>
