@@ -164,6 +164,15 @@
   .emp-bar-track{background:#0d1218;border-radius:6px;height:10px;overflow:hidden;margin-bottom:5px;}
   .emp-bar-fill{height:100%;border-radius:6px;transition:width .3s ease, background .3s ease;}
   .emp-pct{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:8px;}
+  .emp-timeline-stats{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text-dimmer);margin-bottom:10px;}
+  .progress-row{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-dim);margin-bottom:6px;}
+  .progress-row span:first-child{width:26px;flex:0 0 auto;}
+  .progress-row span.mono{width:36px;flex:0 0 auto;text-align:right;}
+  .progress-track{flex:1;background:#0d1218;border-radius:5px;height:8px;overflow:hidden;}
+  .progress-fill{height:100%;border-radius:5px;transition:width .3s ease;}
+  .progress-fill.planned{background:#586170;}
+  .progress-fill.actual{background:var(--teal);}
+  .progress-fill.actual.behind{background:var(--red);}
   .mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;}
   .mcard{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;cursor:pointer;}
   .mcard-head{display:flex;align-items:center;gap:9px;}
@@ -193,6 +202,9 @@
   .ctxmenu button{background:none;border:none;color:var(--text);text-align:left;padding:9px 10px;border-radius:6px;
     font-size:13px;cursor:pointer;}
   .ctxmenu button:hover{background:#1c2430;color:var(--teal);}
+  .ctxmenu-divider{height:1px;background:var(--border);margin:4px 2px;}
+  .ctxmenu button.ctxmenu-danger{color:#ff9d9d;}
+  .ctxmenu button.ctxmenu-danger:hover{background:#3a1518;color:#ff6b6b;}
 
   ::-webkit-scrollbar{width:8px;height:8px;}
   ::-webkit-scrollbar-thumb{background:#263140;border-radius:4px;}
@@ -336,6 +348,13 @@
   <button data-kind="client">+ Kunde</button>
   <button data-kind="project">+ Projekt</button>
   <button data-kind="task">+ Aufgabe</button>
+  <div class="ctxmenu-divider"></div>
+  <button id="ctxClearAll" class="ctxmenu-danger">🗑 Alles löschen</button>
+</div>
+
+<div class="ctxmenu" id="ctxmenuNode">
+  <button id="ctxNodeEdit">Bearbeiten</button>
+  <button id="ctxNodeDelete" class="ctxmenu-danger">🗑 Löschen</button>
 </div>
 
 <script>
@@ -417,7 +436,7 @@
           } else {
             it.__blocked = false;
             const l = loads.get(pid);
-            if(l){ l.total += L; l.breakdown.push({name: it.name + ' (nicht teilbar)', share: L}); }
+            if(l){ l.total += L; l.breakdown.push({name: it.name + ' (nicht teilbar)', share: L, type: it.type, itemId: it.id}); }
           }
         } else { it.__blocked = false; }
       } else {
@@ -428,7 +447,7 @@
           effective.forEach(pid => {
             const share = L * (weightOf(it,pid) / totalW);
             const l = loads.get(pid);
-            if(l){ l.total += share; l.breakdown.push({name: it.name, share}); }
+            if(l){ l.total += share; l.breakdown.push({name: it.name, share, type: it.type, itemId: it.id}); }
           });
         }
       }
@@ -438,7 +457,7 @@
           const oh = it.leadOverhead || 0;
           if(oh > 0){
             const l = loads.get(it.leadId);
-            if(l){ l.total += oh; l.breakdown.push({name: it.name + ' (Leitung)', share: oh}); }
+            if(l){ l.total += oh; l.breakdown.push({name: it.name + ' (Leitung)', share: oh, type: 'project', itemId: it.id}); }
           }
         }
       } else if(it.type === 'project'){ it.__leadOut = false; }
@@ -812,6 +831,68 @@
   }
 
   // ---------------- manager mode ----------------
+  // ---------------- time-based analytics ----------------
+  // average/median utilization of a person across the *entire* configured timeline,
+  // not just the currently-scrubbed day — this is what "wie belastend über die Zeit" needs.
+  function personTimelineStats(pid){
+    const p = state.people.find(pp=>pp.id===pid);
+    if(!p) return {avg:0, median:0, min:0, max:0};
+    const ratios = [];
+    for(let d=0; d<timeline.totalDays; d++){
+      if(personOutOn(pid, d)){ ratios.push(0); continue; }
+      const loads = computeLoads(d);
+      const l = loads.get(pid);
+      ratios.push(l ? l.total / p.capacity : 0);
+    }
+    computeLoads(timeline.currentDay); // restore flags for the day actually on screen
+    const avg = ratios.reduce((a,b)=>a+b,0) / ratios.length;
+    const sorted = [...ratios].sort((a,b)=>a-b);
+    const mid = Math.floor(sorted.length/2);
+    const median = sorted.length % 2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+    return {avg, median, min:sorted[0]||0, max:sorted[sorted.length-1]||0};
+  }
+
+  // A project's "Soll" (planned) progress moves linearly across its planned day range.
+  // Its "Ist" (actual) progress accumulates day by day, but each day's gain is throttled
+  // by how much of the team's capacity that day got eaten by *unplanned tasks* — that's
+  // the mechanism that makes ad-hoc firefighting visibly push the plan off track.
+  function projectPlannedRange(it){
+    const start = it.startDay || 1;
+    const end = Math.max(start, it.endDay || timeline.totalDays);
+    return {start, end, duration: Math.max(1, end - start + 1)};
+  }
+  function plannedProgress(it, day){
+    const {start, end, duration} = projectPlannedRange(it);
+    const hd = humanDay(day);
+    if(hd < start) return 0;
+    if(hd > end) return 1;
+    return (hd - start + 1) / duration;
+  }
+  function actualProgress(it, day){
+    const {start, end, duration} = projectPlannedRange(it);
+    const hd = humanDay(day);
+    if(hd < start) return 0;
+    const lastDay = Math.min(hd, end);
+    let progress = 0;
+    for(let d = start; d <= lastDay; d++){
+      const dayIdx = d - 1;
+      const loads = computeLoads(dayIdx);
+      const distractions = [];
+      it.assignees.forEach(pid => {
+        if(personOutOn(pid, dayIdx)) return;
+        const p = state.people.find(pp=>pp.id===pid);
+        const l = loads.get(pid);
+        if(!p || !l) return;
+        const taskLoad = l.breakdown.filter(b => b.type === 'task').reduce((s,b)=>s+b.share, 0);
+        distractions.push(Math.min(1, taskLoad / p.capacity));
+      });
+      const avgDistraction = distractions.length ? distractions.reduce((a,b)=>a+b,0)/distractions.length : 0;
+      progress += (1/duration) * (1 - avgDistraction);
+    }
+    computeLoads(timeline.currentDay); // restore flags for the day actually on screen
+    return Math.min(1, progress);
+  }
+
   function evalProjectDay(project, day, loads){
     let level = 'ok';
     let structural = false;
@@ -891,11 +972,13 @@
       const l = loads.get(pid) || {total:0, breakdown:[]};
       const ratio = l.total / p.capacity;
       const col = stressColor(ratio);
+      const stats = personTimelineStats(pid);
       return `
         <div class="emp-card">
           <div class="emp-card-head"><h3>${escapeHtml(p.name)}</h3>${out ? '<span class="emp-out-flag">heute ausgefallen</span>' : ''}</div>
           <div class="emp-bar-track"><div class="emp-bar-fill" style="width:${Math.min(100, ratio*100)}%;background:${col}"></div></div>
-          <div class="emp-pct" style="color:${col}">${Math.round(ratio*100)}% · ${l.total.toFixed(1)} von ${p.capacity}</div>
+          <div class="emp-pct" style="color:${col}">${Math.round(ratio*100)}% heute · ${l.total.toFixed(1)} von ${p.capacity}</div>
+          <div class="emp-timeline-stats">Ø ${Math.round(stats.avg*100)}% · Median ${Math.round(stats.median*100)}% über ${timeline.totalDays} Tage</div>
           <ul class="breakdown">${l.breakdown.length ? l.breakdown.map(b=>`<li><span>${escapeHtml(b.name)}</span><span class="mono">${b.share.toFixed(1)}</span></li>`).join('') : '<li>Keine Zuordnungen heute</li>'}</ul>
         </div>`;
     }).join('');
@@ -950,6 +1033,34 @@
     return n.type;
   }
 
+  function deleteEntityById(id){
+    const n = findNode(id);
+    if(!n) return;
+    const type = nodeType(n);
+    if(type === 'person'){
+      state.people = state.people.filter(p=>p.id!==id);
+      state.items.forEach(it=>{ it.assignees = it.assignees.filter(pid=>pid!==id); if(it.leadId===id) it.leadId=''; if(it.weights) delete it.weights[id]; });
+      state.absences = state.absences.filter(a=>a.personId!==id);
+      refreshSelects(); renderAbsenceList();
+    } else if(type === 'client'){
+      state.clients = state.clients.filter(c=>c.id!==id);
+      state.items.forEach(it=>{ if(it.clientId===id) it.clientId=''; });
+      refreshSelects();
+    } else {
+      state.items = state.items.filter(i=>i.id!==id);
+    }
+    if(selectedId === id) selectedId = null;
+    render(); renderDetail();
+  }
+
+  function clearEverything(){
+    state.people = []; state.clients = []; state.items = []; state.absences = [];
+    selectedId = null; hoveredId = null; preSortPositions = null;
+    nodeById.clear(); pendingPositions.clear();
+    document.getElementById('undoBtn').disabled = true;
+    refreshSelects(); renderAbsenceList(); render(); renderDetail();
+  }
+
   function renderDetail(){
     const el = document.getElementById('detail-content');
     const n = findNode(selectedId);
@@ -974,6 +1085,7 @@
         <div class="field"><label>${lbl('Kapazität', 'Wie viel Last diese Person insgesamt tragen kann, bevor sie über 100% liegt.')}<input type="number" id="d-capacity" value="${n.capacity}" min="1"></label></div>
         <div class="totalload" style="color:${stressColor(ratio)}">${Math.round(ratio*100)}% ausgelastet</div>
         <div class="hint">${l.total.toFixed(1)} von ${n.capacity} Kapazität belegt (heute)</div>
+        <div class="emp-timeline-stats" style="margin-top:6px;">Ø ${Math.round(personTimelineStats(n.id).avg*100)}% · Median ${Math.round(personTimelineStats(n.id).median*100)}% über ${timeline.totalDays} Tage</div>
         <ul class="breakdown">${l.breakdown.length ? l.breakdown.map(b=>`<li><span>${escapeHtml(b.name)}</span><span class="mono">${b.share.toFixed(1)}</span></li>`).join('') : '<li>Keine Zuordnungen heute</li>'}</ul>
         ${myAbsences.length ? `<div class="hint" style="margin-top:10px;">Ausfälle: ${myAbsences.map(a=>'Tag '+a.startDay+'–'+a.endDay).join(', ')}</div>` : ''}
         <div class="delete-row"><button class="ghost" id="d-delete">Person löschen</button></div>
@@ -981,12 +1093,7 @@
       document.getElementById('d-name').addEventListener('change', e => { n.name = e.target.value || n.name; render(); renderDetail(); });
       document.getElementById('d-icon').addEventListener('change', e => { n.icon = e.target.value; render(); renderDetail(); });
       document.getElementById('d-capacity').addEventListener('change', e => { n.capacity = Math.max(1, +e.target.value||1); render(); renderDetail(); });
-      document.getElementById('d-delete').addEventListener('click', () => {
-        state.people = state.people.filter(p=>p.id!==n.id);
-        state.items.forEach(it=>{ it.assignees = it.assignees.filter(id=>id!==n.id); if(it.leadId===n.id) it.leadId=''; });
-        state.absences = state.absences.filter(a=>a.personId!==n.id);
-        selectedId = null; refreshSelects(); renderAbsenceList(); render(); renderDetail();
-      });
+      document.getElementById('d-delete').addEventListener('click', () => deleteEntityById(n.id));
       return;
     }
 
@@ -1004,11 +1111,7 @@
       `;
       document.getElementById('d-name').addEventListener('change', e => { n.name = e.target.value || n.name; render(); renderDetail(); });
       document.getElementById('d-icon').addEventListener('change', e => { n.icon = e.target.value; render(); renderDetail(); });
-      document.getElementById('d-delete').addEventListener('click', () => {
-        state.clients = state.clients.filter(c=>c.id!==n.id);
-        state.items.forEach(it=>{ if(it.clientId===n.id) it.clientId=''; });
-        selectedId = null; refreshSelects(); render(); renderDetail();
-      });
+      document.getElementById('d-delete').addEventListener('click', () => deleteEntityById(n.id));
       return;
     }
 
@@ -1057,6 +1160,25 @@
         <div class="field"><label>${lbl('Kunde', 'Für welchen Kunden das Projekt läuft. Rein informativ, hat keinen Einfluss auf die Auslastung.')} <select id="d-client"><option value="">— keiner —</option>${state.clients.map(c=>`<option value="${c.id}" ${n.clientId===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select></label></div>
         <div class="field"><label>${lbl('Projektleitung', 'Wer die Projektleitung übernimmt. Bekommt zusätzlich zum eigenen Arbeitsanteil den Leitungsaufwand oben drauf. Fällt sie aus, gilt das Projekt als blockiert.')} <select id="d-lead"><option value="">— keine —</option>${state.people.map(p=>`<option value="${p.id}" ${n.leadId===p.id?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label></div>
         <div class="field"><label>${lbl('Leitungsaufwand', 'Zusätzliche, feste Last nur für die Projektleitung — oben auf ihren normalen Anteil am Projekt.')}<input type="number" id="d-overhead" value="${n.leadOverhead||0}" min="0"></label></div>
+        <div class="field">
+          <label>${lbl('Geplanter Zeitraum', 'Von welchem bis zu welchem Tag das Projekt laufen soll. Bestimmt den Soll-Fortschritt (linear über diesen Zeitraum).')}</label>
+          <div class="row2">
+            <input type="number" id="d-startday" placeholder="Von Tag" min="1" value="${n.startDay||1}" style="min-height:32px;">
+            <input type="number" id="d-endday" placeholder="Bis Tag" min="1" value="${n.endDay||timeline.totalDays}" style="min-height:32px;">
+          </div>
+        </div>
+        <div class="field">
+          <label>${lbl('Fortschritt', 'Soll = wo das Projekt bei linearem Verlauf heute stehen müsste. Ist = wie weit es wirklich ist. Ungeplante Aufgaben, die dem Team Zeit stehlen, bremsen den Ist-Fortschritt.')}</label>
+          ${(() => {
+            const planned = plannedProgress(n, day), actual = actualProgress(n, day);
+            const behind = actual < planned - 0.05;
+            return `
+              <div class="progress-row"><span>Soll</span><div class="progress-track"><div class="progress-fill planned" style="width:${Math.round(planned*100)}%"></div></div><span class="mono">${Math.round(planned*100)}%</span></div>
+              <div class="progress-row"><span>Ist</span><div class="progress-track"><div class="progress-fill actual ${behind?'behind':''}" style="width:${Math.round(actual*100)}%"></div></div><span class="mono">${Math.round(actual*100)}%</span></div>
+              ${behind ? '<div class="hint" style="color:var(--red);margin-top:4px;">Liegt hinter Plan — ungeplante Aufgaben kosten dem Team Zeit.</div>' : ''}
+            `;
+          })()}
+        </div>
       ` : ''}
       <div class="field">
         <label>${lbl('Zugeordnete Personen'+(!isProject && !n.shareable ? ' (max. 1, nicht teilbar)' : ''), 'Wer an diesem Punkt mitarbeitet. Bei teilbaren Projekten/Aufgaben kannst du rechts pro Person einen Anteil einstellen — höherer Wert heißt, diese Person übernimmt mehr von der Last als die anderen.')}</label>
@@ -1099,6 +1221,8 @@
       document.getElementById('d-client').addEventListener('change', e => { n.clientId = e.target.value; render(); renderDetail(); });
       document.getElementById('d-lead').addEventListener('change', e => { n.leadId = e.target.value; render(); renderDetail(); });
       document.getElementById('d-overhead').addEventListener('change', e => { n.leadOverhead = Math.max(0, +e.target.value||0); render(); renderDetail(); });
+      document.getElementById('d-startday').addEventListener('change', e => { n.startDay = Math.max(1, +e.target.value||1); render(); renderDetail(); });
+      document.getElementById('d-endday').addEventListener('change', e => { n.endDay = Math.max(n.startDay||1, +e.target.value||timeline.totalDays); render(); renderDetail(); });
     }
     el.querySelectorAll('.assignlist input[type=checkbox]').forEach(cb => {
       cb.addEventListener('change', e => {
@@ -1137,10 +1261,7 @@
         render(); renderDetail();
       });
     });
-    document.getElementById('d-delete').addEventListener('click', () => {
-      state.items = state.items.filter(i=>i.id!==n.id);
-      selectedId = null; render(); renderDetail();
-    });
+    document.getElementById('d-delete').addEventListener('click', () => deleteEntityById(n.id));
   }
 
   // ---------------- forms ----------------
@@ -1266,20 +1387,25 @@
 
   window.addEventListener('resize', () => render());
 
-  // ---------------- right-click add menu ----------------
+  // ---------------- right-click menus (add on background, delete on a node) ----------------
   const ctxmenu = document.getElementById('ctxmenu');
+  const ctxmenuNode = document.getElementById('ctxmenuNode');
 
-  function showCtxMenu(clientX, clientY, gx, gy){
-    const menuW = 180, menuH = 160;
+  function showMenu(menu, clientX, clientY, menuH){
+    hideCtxMenu();
+    const menuW = 190;
     const x = Math.min(clientX, window.innerWidth - menuW - 8);
     const y = Math.min(clientY, window.innerHeight - menuH - 8);
-    ctxmenu.style.left = x + 'px';
-    ctxmenu.style.top = y + 'px';
-    ctxmenu.style.display = 'flex';
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+    menu.style.display = 'flex';
+  }
+  function showCtxMenu(clientX, clientY, gx, gy){
+    showMenu(ctxmenu, clientX, clientY, 200);
     ctxmenu.dataset.gx = gx;
     ctxmenu.dataset.gy = gy;
   }
-  function hideCtxMenu(){ ctxmenu.style.display = 'none'; }
+  function hideCtxMenu(){ ctxmenu.style.display = 'none'; ctxmenuNode.style.display = 'none'; }
 
   svg.on('click', function(ev){
     if(ev.target !== svg.node() && !ev.target.classList.contains('zoom-root')) return;
@@ -1290,10 +1416,36 @@
 
   svg.on('contextmenu', function(ev){
     ev.preventDefault();
+    const nodeGroup = ev.target.closest ? ev.target.closest('g.node') : null;
+    if(nodeGroup){
+      const d = d3.select(nodeGroup).datum();
+      if(d){
+        ctxmenuNode.dataset.targetId = d.id;
+        showMenu(ctxmenuNode, ev.clientX, ev.clientY, 90);
+        return;
+      }
+    }
     const [mx, my] = d3.pointer(ev, svg.node());
     const t = d3.zoomTransform(svg.node());
     const [gx, gy] = t.invert([mx, my]);
     showCtxMenu(ev.clientX, ev.clientY, gx, gy);
+  });
+
+  document.getElementById('ctxNodeDelete').addEventListener('click', () => {
+    const id = ctxmenuNode.dataset.targetId;
+    hideCtxMenu();
+    if(id) deleteEntityById(id);
+  });
+  document.getElementById('ctxNodeEdit').addEventListener('click', () => {
+    const id = ctxmenuNode.dataset.targetId;
+    hideCtxMenu();
+    if(id){ selectedId = id; renderDetail(); openDetailMobile(); render(); }
+  });
+  document.getElementById('ctxClearAll').addEventListener('click', () => {
+    hideCtxMenu();
+    if(confirm('Wirklich alles löschen? Personen, Kunden, Projekte, Aufgaben und Ausfälle werden komplett entfernt. Das lässt sich nicht rückgängig machen.')){
+      clearEverything();
+    }
   });
 
   function quickAdd(kind, gx, gy){
@@ -1321,7 +1473,7 @@
       hideCtxMenu();
     });
   });
-  document.addEventListener('click', e => { if(!ctxmenu.contains(e.target)) hideCtxMenu(); });
+  document.addEventListener('click', e => { if(!ctxmenu.contains(e.target) && !ctxmenuNode.contains(e.target)) hideCtxMenu(); });
   document.addEventListener('scroll', hideCtxMenu, true);
 
   // ---------------- seed example ----------------
